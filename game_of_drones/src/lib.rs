@@ -47,8 +47,8 @@ impl GameOfDrones {
                             PacketType::Nack(_nack) => unimplemented!(),
                             PacketType::Ack(_ack) => unimplemented!(),
                             PacketType::MsgFragment(_fragment) => unimplemented!(),
-                            //PacketType::FloodRequest(_) => unimplemented!(),
-                            //PacketType::FloodResponse(_) => unimplemented!(),
+                            PacketType::FloodRequest(_) => unimplemented!(),
+                            PacketType::FloodResponse(_) => unimplemented!(),
                         }
                     }
                 },
@@ -123,7 +123,7 @@ pub fn populate_channels(){
         //clones all the sender channels for the connected drones
         let mut packet_send: HashMap<NodeId, Sender<Packet>> = HashMap::new();
 
-        for connected_drone in drone.connected_drone_ids.iter() {
+        for connected_drone in drone.connected_node_ids.iter() {
             packet_send.insert(
                 *connected_drone as NodeId,
                 packet_channels
