@@ -1,12 +1,10 @@
-use std::thread::{self, spawn, JoinHandle};
-use std::time::TryFromFloatSecsError;
-use std::{collections::HashMap, hash::Hash};
-use crossbeam_channel::{Sender,Receiver,select, unbounded};
-use wg_2024::config::Config;
+use std::collections::HashMap;
+use crossbeam_channel::{Sender,Receiver,select};
 use wg_2024::packet::PacketType;
 use wg_2024::{network::NodeId, packet::Packet};
-use wg_2024::drone::{Drone, DroneOptions};
+use wg_2024::drone::{Drone,DroneOptions};
 use wg_2024::controller::Command;
+
 
 pub struct GameOfDrones {
     pub id: NodeId,
@@ -25,7 +23,7 @@ impl Drone for GameOfDrones {
             sim_contr_send: options.sim_contr_send, 
             sim_contr_recv: options.sim_contr_recv,
             packet_recv: options.packet_recv,
-            packet_send: HashMap::new(),
+            packet_send: options.packet_send,
             pdr: options.pdr
         }
     }
@@ -64,6 +62,7 @@ impl GameOfDrones {
     pub fn new(op: DroneOptions)->Self{
         Drone::new(op)
     }
+
     pub fn get_neighbours_id(&self)->Vec<NodeId>{
         let mut vec: Vec<NodeId> = Vec::new();
         for id in &self.packet_send {
@@ -72,20 +71,19 @@ impl GameOfDrones {
         vec
     }
 
-    pub fn forward_packet(&self,packet: Packet,rec_id: NodeId/* other data?? */)->bool{
-        if let Some(sender) = self.packet_send.get_key_value(&rec_id){
-            sender.1.send(packet);
-            return true;
+    pub fn forward_packet(&self,mut packet: Packet,rec_id: NodeId/* other data?? */)->Result<(), crossbeam_channel::SendError<Packet>>{
+        packet.routing_header.hop_index+=1;
+        match self.packet_send.get(&rec_id).unwrap().send(packet) {
+            Ok(())=>{
+                Ok(())
+            },
+            Err(e)=>{
+                Err(e)
+            }
         }
-        false
     }
 
-    pub fn show_data(&self){  //show own data + neighbours + packet status in own comms channel ??
-        if self.packet_recv.recv().is_ok(){
-            println!("OK");
-        } else {
-            println!("ERR");
-        }
+    pub fn show_data(&self){  //show own data + neighbours + packet status in comms channels ??
     }
 
     pub fn release_channels(&self){
@@ -94,77 +92,4 @@ impl GameOfDrones {
         // so I dont' know if it's purely a drone api but for know let's put it here.
         unimplemented!()
     }
-
-    
-
 }
-
-pub fn populate_channels(){
-    let config: wg_2024::config::Config = todo!();
-
-    // these hashmaps can then be stored in the simulation controller
-    let mut packet_channels: HashMap<NodeId, (Sender<Packet>, Receiver<Packet>)> = HashMap::new();
-    let mut command_channels: HashMap<NodeId, (Sender<Command>, Receiver<Command>)> =
-        HashMap::new();
-
-    let mut join_handles: Vec<JoinHandle<()>> = Vec::new();
-
-    //
-    // since the config doesn't use NodeId but u64 in this branch, you'll see conversions that won't be needed in the future
-    //
-
-    for drone in config.drone.iter() {
-        //create unbounded channel for drones
-        packet_channels.insert(drone.id as NodeId, unbounded::<Packet>());
-        command_channels.insert(drone.id as NodeId, unbounded::<Command>());
-    }
-
-    for drone in config.drone.iter() {
-        //clones all the sender channels for the connected drones
-        let mut packet_send: HashMap<NodeId, Sender<Packet>> = HashMap::new();
-
-        for connected_drone in drone.connected_node_ids.iter() {
-            packet_send.insert(
-                *connected_drone as NodeId,
-                packet_channels
-                    .get(&(*connected_drone as NodeId))
-                    .unwrap()
-                    .0
-                    .clone(),
-            );
-        }
-
-        // clone the channels to give them to each thread
-        let packet_recv = packet_channels.get(&(drone.id as u8)).unwrap().1.clone();
-        let sim_contr_recv = command_channels.get(&(drone.id as u8)).unwrap().1.clone();
-        let sim_contr_send = command_channels.get(&(drone.id as u8)).unwrap().0.clone();
-
-        // since the thread::spawn function will take ownership of the values, we need to copy or clone the values from 'drone' since it's a borrow
-        let id: NodeId = drone.id.try_into().unwrap();
-        let pdr = drone.pdr as f32;
-
-
-
-        join_handles.push(thread::spawn(move || {
-            let mut drone = GameOfDrones::new(DroneOptions {
-                id,
-                sim_contr_recv,
-                sim_contr_send,
-                packet_recv,
-                pdr,
-                //packet_send,
-            });
-
-            drone.run();
-        }));
-
-
-    }
-
-    // here you'd create your simulation controller and also pass all the channels to it
-
-    // joining behaviour needs to be refined
-    join_handles[0].join().ok();
-}
-
-
