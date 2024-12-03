@@ -1,15 +1,15 @@
 use crossbeam_channel::{select_biased, Receiver, Sender};
 use rand::{self, Rng};
 use std::collections::{HashMap, HashSet};
-use wg_2024::controller::{DroneCommand, NodeEvent};
-use wg_2024::drone::{Drone, DroneOptions};
+use wg_2024::controller::{DroneCommand, DroneEvent};
+use wg_2024::drone::Drone;
 use wg_2024::network::SourceRoutingHeader;
-use wg_2024::packet::{FloodResponse, Nack, NackType, NodeType, PacketType};
+use wg_2024::packet::{FloodRequest, FloodResponse, Nack, NackType, NodeType, PacketType};
 use wg_2024::{network::NodeId, packet::Packet};
 
 pub struct GameOfDrones {
     pub id: NodeId,
-    pub controller_send: Sender<NodeEvent>,
+    pub controller_send: Sender<DroneEvent>,
     pub controller_recv: Receiver<DroneCommand>,
     pub packet_recv: Receiver<Packet>,
     pub packet_send: HashMap<NodeId, Sender<Packet>>,
@@ -18,14 +18,21 @@ pub struct GameOfDrones {
 }
 
 impl Drone for GameOfDrones {
-    fn new(options: DroneOptions) -> Self {
-        Self {
-            id: options.id,
-            controller_send: options.controller_send,
-            controller_recv: options.controller_recv,
-            packet_recv: options.packet_recv,
-            packet_send: options.packet_send,
-            pdr: options.pdr,
+    fn new(
+        id: NodeId,
+        controller_send: Sender<DroneEvent>,
+        controller_recv: Receiver<DroneCommand>,
+        packet_recv: Receiver<Packet>,
+        packet_send: HashMap<NodeId, Sender<Packet>>,
+        pdr: f32,
+    ) -> Self {
+        Self{
+            id,
+            controller_send,
+            controller_recv,
+            packet_recv,
+            packet_send,
+            pdr,
             flood_ids: HashSet::new(),
         }
     }
@@ -42,9 +49,20 @@ impl GameOfDrones {
                 recv(self.controller_recv) -> command_res => {
                     if let Ok(command) = command_res {
                         match command {
-                            DroneCommand::Crash=>{todo!()},
-                            DroneCommand::AddSender(_id,_sender)=>{todo!()},
-                            DroneCommand::SetPacketDropRate(_pdr)=>{todo!()}
+                            DroneCommand::Crash=>{
+                                self.crash_handle();
+                                println!("Drone{} has been taken down",self.id);
+                                break;
+                            },
+                            DroneCommand::AddSender(id,sender)=>{
+                                self.add_sender(id,sender.clone());
+                            },
+                            DroneCommand::SetPacketDropRate(pdr)=>{
+                                self.set_pdr(pdr);
+                            },
+                            DroneCommand::RemoveSender(id)=>{
+                                self.remove_sender(id);
+                            },
                         }
                     }
                 },
@@ -57,9 +75,9 @@ impl GameOfDrones {
         }
     }
 
-    pub fn new(op: DroneOptions) -> Self {
-        Drone::new(op)
-    }
+    // pub fn new(op: DroneOptions) -> Self {
+    //     Drone::new(op)
+    // }
 
     //Used in the flood_request_handle to get all the sender without cloning the all hashmap;
     
@@ -72,26 +90,22 @@ impl GameOfDrones {
     }
 
     /// Below there are the function for packet handling
-    /// TODO!!! : add send NodeEvent::Dropped in case of dropped packet;
+    
 
     //Wrapper function, to handle the diffrent packets
-    //TODO!!: Decide if its useless
 
-    fn forward_packet(&self, packet: Packet) /*->Result<(), crossbeam_channel::SendError<Packet>>*/
+    fn forward_packet(&mut self, packet: Packet) /*->Result<(), crossbeam_channel::SendError<Packet>>*/
     {
         match &packet.pack_type {
             PacketType::FloodRequest(f) => {
-                self.flood_request_handle(packet.clone(), f.path_trace.clone(), f.flood_id);
-            }
-            PacketType::FloodResponse(_f) => {
-                self.flood_response_handle(packet.clone());
-            }
+                self.flood_request_handle(packet.clone(), f.path_trace.clone(), f.flood_id, f.initiator_id);
+            },
             PacketType::MsgFragment(f) => {
                 //b: check pdr
                 self.fragment_handle(packet.clone(), f.fragment_index);
-            }
+            },
             _ => {
-                self.nack_ack_handle(packet.clone());
+                self.nfa_handle(packet.clone());
             }
         }
     }
@@ -107,6 +121,7 @@ impl GameOfDrones {
                 if self.check_error_in_routing(&packet, fragment_index) {
                     //Step 5
                     if self.drop_check() {
+                        self.controller_send.send(DroneEvent::PacketDropped(packet.clone())).ok();
                         let nack_type = NackType::Dropped;
                         self.create_nack_n_send(
                             packet.routing_header.hops.clone(),
@@ -123,6 +138,7 @@ impl GameOfDrones {
                             .unwrap()
                             .send(packet.clone())
                             .ok();
+                        self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
                     }
                 }
             }
@@ -135,21 +151,33 @@ impl GameOfDrones {
     // hop_index set to 1 and an hops vector that is the path_trace ids reversed.
 
     fn flood_request_handle(
-        &self,
+        &mut self,
         packet: Packet,
         mut path_trace: Vec<(NodeId, NodeType)>,
         flood_id: u64,
+        initiator_id: u8
     ) {
         if let Some(_id) = self.flood_ids.get(&flood_id) {
+            println!("Flooding already received");
             path_trace.push((self.id, NodeType::Drone));
             self.create_flood_response_n_send(flood_id, path_trace.clone(),packet.session_id);
         } else {
+            self.flood_ids.insert(flood_id);
             path_trace.push((self.id, NodeType::Drone));
             if self.get_neighbours_id().len()==1{   
+                println!("Just one neighbor");
                 self.create_flood_response_n_send(flood_id, path_trace.clone(),packet.session_id);
             } else {
                 for sender in self.get_neighbours_id() {
-                    self.packet_send.get(&sender).unwrap().send(packet.clone()).ok();
+                    if sender != path_trace.clone()[path_trace.clone().len()-2].0{
+                        let facket = Packet {
+                            pack_type: PacketType::FloodRequest(FloodRequest{flood_id,initiator_id,path_trace: path_trace.clone()}),
+                            routing_header: packet.routing_header.clone(),
+                            session_id: packet.session_id
+                        };
+                        self.packet_send.get(&sender).unwrap().send(facket.clone()).ok();
+                        self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
+                    }
                 }
             }
         }
@@ -159,29 +187,36 @@ impl GameOfDrones {
     // ignored, but it can't be dropped; so it execute all the steps of the drone protocol paragraph minus the
     // drop part 
 
-    fn flood_response_handle(&self, mut packet: Packet) {
-        //Step 1
-        if self.check_unexpected_recipient(&packet, 0) {
-            //Step 3
-            if self.check_destination_is_drone(&packet, 0) {
-                if self.check_error_in_routing(&packet, 0) {
-                    //Step 5
-                    packet.routing_header.hop_index += 1;
-                    let next_hop = packet.routing_header.hops[packet.routing_header.hop_index];
-                    self.packet_send
-                        .get(&next_hop)
-                        .unwrap()
-                        .send(packet.clone())
-                        .ok();
-                }
-            }
-        }
-    }
+    // fn flood_response_handle(&self, mut packet: Packet) {
+    //     //Step 1
+    //     if self.check_unexpected_recipient(&packet, 0) {
+    //         //Step 3
+    //         if self.check_destination_is_drone(&packet, 0) {
+    //             if self.check_error_in_routing(&packet, 0) {
+    //                 //Step 5
+    //                 packet.routing_header.hop_index += 1;
+    //                 let next_hop = packet.routing_header.hops[packet.routing_header.hop_index];
+    //                 self.packet_send
+    //                     .get(&next_hop)
+    //                     .unwrap()
+    //                     .send(packet.clone())
+    //                     .ok();
+    //                 self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
+    //             } else {
+    //                 println!("ERROR IN ROUTING");
+    //             }
+    //         } else {
+    //             println!("ERROR IN DEST");
+    //         }
+    //     } else {
+    //         println!("ERROR IN RECIPIENT");
+    //     }
+    // }
 
     //Nack and Ack messages are treated the same by the drones so we use just one function
     //TODO!!: probably better to merge flood_response_handle with nack_ack_handle
 
-    fn nack_ack_handle(&self, mut packet: Packet) {
+    fn nfa_handle(&self, mut packet: Packet) {
         if self.check_unexpected_recipient(&packet, 0) {
             if self.check_destination_is_drone(&packet, 0) {
                 if self.check_error_in_routing(&packet, 0) {
@@ -191,9 +226,17 @@ impl GameOfDrones {
                         .get(&next_hop)
                         .unwrap()
                         .send(packet.clone())
-                        .ok();
+                        .ok(); 
+                    self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
+                } else {
+                    self.controller_send.send(DroneEvent::ControllerShortcut(packet.clone())).ok();
+                    eprintln!("Error in routing");
                 }
+            } else {
+                eprintln!("Error in destination");
             }
+        } else {
+            eprintln!("Error in recipient");
         }
     }
 
@@ -221,7 +264,7 @@ impl GameOfDrones {
     // Function to check if the drone is the dest of the packet, behavior as the previous function
 
     fn check_destination_is_drone(&self, packet: &Packet, fragment_index: u64) -> bool {
-        if packet.routing_header.hop_index != packet.routing_header.hops.len()-1 {
+        if packet.routing_header.hop_index != packet.routing_header.hops.len() {
             true
         } else {
             let nack_type = NackType::DestinationIsDrone;
@@ -240,14 +283,14 @@ impl GameOfDrones {
     // Function to check if the next_hop is actually a neighbour of the drone, behaves as the previous functions
 
     fn check_error_in_routing(&self, packet: &Packet, fragment_index: u64) -> bool {
-        let next_hop = packet.routing_header.hops[packet.routing_header.hop_index];
+        let next_hop = packet.routing_header.hops[packet.routing_header.hop_index+1];
         if self.get_neighbours_id().contains(&next_hop) {
             true
         } else {
             let nack = NackType::ErrorInRouting(next_hop);
             self.create_nack_n_send(
                 packet.routing_header.hops.clone(),
-                packet.routing_header.hop_index,
+                packet.routing_header.hop_index+1,
                 nack,
                 packet.session_id,
                 fragment_index
@@ -257,13 +300,13 @@ impl GameOfDrones {
     }
 
     //Function to decide if the packet has to be dropped, it generates a random value if the pdr
-    // is less than the value it returns true.
-    // It's used only in fragment_handle(..) because it's the only packet that can be dropped.
+    // is gt the value it returns true.
+    //It's used only in fragment_handle(..) as it's the only packet that can be dropped.
 
     fn drop_check(&self) -> bool {
         let mut rng = rand::thread_rng();
         let random_value: f32 = rng.gen_range(0.01..1.00); // Generate a random float between 0 and 1.0
-        if random_value > self.pdr {
+        if random_value < self.pdr {
             true
         } else {
             false
@@ -278,8 +321,10 @@ impl GameOfDrones {
     fn create_nack_n_send(&self, hops: Vec<u8>, hop_index: usize, nack_type: NackType, session_id: u64, fragment_index: u64) {
         let mut routing_header = SourceRoutingHeader {
             hop_index: 1,
-            hops: hops.clone(),
+            hops: hops.clone().split_at(hop_index).0.to_vec(),
         };
+        println!("{}",hop_index);
+
         routing_header.hops.reverse();
         let nack  = Nack { fragment_index, nack_type };
         let nack_packet = Packet {
@@ -290,8 +335,10 @@ impl GameOfDrones {
         self.packet_send
             .get(&nack_packet.routing_header.hops.clone()[nack_packet.routing_header.hop_index])
             .unwrap()
-            .send(nack_packet)
+            .send(nack_packet.clone())
             .ok();
+        self.controller_send.send(DroneEvent::PacketSent(nack_packet.clone())).ok();
+
     }
 
     //Following the rules of the flooding protocol it does the same as the create_nack_n_send.
@@ -301,8 +348,10 @@ impl GameOfDrones {
             flood_id,
             path_trace: path_trace.clone(),
         };
+        println!("{:?}",path_trace.clone());
         let mut hops: Vec<u8> = path_trace.clone().into_iter().map(|f| f.0).collect();
         hops.reverse();
+        println!("{:?}",hops.clone());
         let packet = Packet {
             pack_type: PacketType::FloodResponse(response),
             routing_header: SourceRoutingHeader { hop_index: 1, hops },
@@ -311,18 +360,31 @@ impl GameOfDrones {
         self.packet_send
             .get(&packet.routing_header.hops[packet.routing_header.hop_index])
             .unwrap()
-            .send(packet)
+            .send(packet.clone())
             .ok();
+        self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
     }
 
 
-    ///TODO!!!: Below there are the functions for command handling;
-    #[allow(dead_code)]
-    fn crash_handle(){unimplemented!()}
-    #[allow(dead_code)]
-    fn add_sender(){unimplemented!()}
-    #[allow(dead_code)]
-    fn set_pdr(){unimplemented!()}
+    /// Below there are the functions for command handling;
+    fn crash_handle(&mut self){
+        while let Ok(packet) = self.packet_recv.recv(){
+            self.forward_packet(packet);
+        }
+    }
+    
+    fn add_sender(&mut self, id: NodeId, sender: Sender<Packet>){
+        self.packet_send.insert(id, sender).unwrap();
+    }
+    
+    fn set_pdr(&mut self, pdr: f32){
+        self.pdr = pdr;
+    }
+
+    fn remove_sender(&mut self, id: NodeId) {
+        self.packet_send.remove(&id);
+    }
+
 }
 
 
@@ -331,84 +393,84 @@ mod test {
     use std::collections::HashMap;
 
     use crossbeam_channel::unbounded;
-    use wg_2024::{controller::{self, DroneCommand, NodeEvent}, drone::DroneOptions, network::SourceRoutingHeader, packet::{Ack, Packet, PacketType}};
+    use wg_2024::{ controller::{DroneCommand, DroneEvent}, drone::Drone, network::SourceRoutingHeader, packet::{Ack, Packet, PacketType}};
 
     use crate::GameOfDrones;
 
     #[test]
     fn test_1 (){
         let (packet_send_1, packet_recv_1) = unbounded::<Packet>();
-        let (packet_send_2, _packet_recv_2) = unbounded::<Packet>();
+        let (packet_send_2, packet_recv_2) = unbounded::<Packet>();
         
         let (_command_send_1, command_recv_1) = unbounded::<DroneCommand>();
-        let (command_send_2, _command_recv_2) = unbounded::<NodeEvent>();
+        let (command_send_2, _command_recv_2) = unbounded::<DroneEvent>();
 
-        let mut drone_op_1 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_1 = ( 
+            1, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_1.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_1.packet_send.insert(2, packet_send_1.clone());
+        drone_op_1.4.insert(2, packet_send_1.clone());
 
-        let mut drone_op_2 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_2 =(
+            2, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_2.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_2.packet_send.insert(1, packet_send_2.clone());
+        drone_op_2.4.insert(1, packet_send_2.clone());
 
-        let drone1 = GameOfDrones::new(drone_op_1);
-        let drone2 = GameOfDrones::new(drone_op_2);
+        let drone1 = GameOfDrones::new(drone_op_1.0, drone_op_1.1, drone_op_1.2, drone_op_1.3, drone_op_1.4, drone_op_1.5);
+        let drone2 = GameOfDrones::new(drone_op_2.0, drone_op_2.1, drone_op_2.2, drone_op_2.3, drone_op_2.4, drone_op_2.5);
 
         let pack_type = PacketType::Ack(Ack{fragment_index: 0});
-        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 2, hops: [3,1,2].to_vec()},session_id: 1};
+        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 3, hops: [3,1,2].to_vec()},session_id: 1};
         assert_eq!(drone2.check_destination_is_drone(&packet1, 0),false);
     }
 
     #[test]
     fn test_2() {
         let (packet_send_1, packet_recv_1) = unbounded::<Packet>();
-        let (packet_send_2, _packet_recv_2) = unbounded::<Packet>();
+        let (packet_send_2, packet_recv_2) = unbounded::<Packet>();
         
         let (_command_send_1, command_recv_1) = unbounded::<DroneCommand>();
-        let (command_send_2, _command_recv_2) = unbounded::<NodeEvent>();
+        let (command_send_2, _command_recv_2) = unbounded::<DroneEvent>();
 
-        let mut drone_op_1 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_1 = ( 
+            1, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_1.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_1.packet_send.insert(2, packet_send_1.clone());
+        drone_op_1.4.insert(2, packet_send_1.clone());
 
-        let mut drone_op_2 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_2 =(
+            2, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_2.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_2.packet_send.insert(1, packet_send_2.clone());
+        drone_op_2.4.insert(1, packet_send_2.clone());
 
-        let drone1 = GameOfDrones::new(drone_op_1);
-        let drone2 = GameOfDrones::new(drone_op_2);
+        let drone1 = GameOfDrones::new(drone_op_1.0, drone_op_1.1, drone_op_1.2, drone_op_1.3, drone_op_1.4, drone_op_1.5);
+        let drone2 = GameOfDrones::new(drone_op_2.0, drone_op_2.1, drone_op_2.2, drone_op_2.3, drone_op_2.4, drone_op_2.5);
 
         let pack_type = PacketType::Ack(Ack{fragment_index: 0});
-        let packet2 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 2, hops: [3,1,2].to_vec()},session_id: 1};
-        assert_eq!(drone1.check_error_in_routing(&packet2, 0),true);
+        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 2, hops: [3,2,1].to_vec()},session_id: 1};
+        assert_eq!(drone2.check_error_in_routing(&packet1, 0),true);
     }
 
 
@@ -418,35 +480,35 @@ mod test {
         let (packet_send_2, _packet_recv_2) = unbounded::<Packet>();
         
         let (_command_send_1, command_recv_1) = unbounded::<DroneCommand>();
-        let (command_send_2, _command_recv_2) = unbounded::<NodeEvent>();
+        let (command_send_2, _command_recv_2) = unbounded::<DroneEvent>();
 
-        let mut drone_op_1 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_1 = ( 
+            1, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_1.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_1.packet_send.insert(2, packet_send_1.clone());
+        drone_op_1.4.insert(2, packet_send_1.clone());
 
-        let mut drone_op_2 = DroneOptions { 
-            id: 1, 
-            controller_send: command_send_2.clone(),
-            controller_recv: command_recv_1.clone(),
-            packet_recv: packet_recv_1.clone(),
-            packet_send: HashMap::new(),
-            pdr: 0.05
-        };
+        let mut drone_op_2 =(
+            2, 
+            command_send_2.clone(),
+            command_recv_1.clone(),
+            packet_recv_1.clone(),
+            HashMap::new(),
+            0.05
+        );
 
-        drone_op_2.packet_send.insert(1, packet_send_2.clone());
+        drone_op_2.4.insert(1, packet_send_2.clone());
 
-        let drone1 = GameOfDrones::new(drone_op_1);
-        let drone2 = GameOfDrones::new(drone_op_2);
+        let drone1 = GameOfDrones::new(drone_op_1.0, drone_op_1.1, drone_op_1.2, drone_op_1.3, drone_op_1.4, drone_op_1.5);
+        let drone2 = GameOfDrones::new(drone_op_2.0, drone_op_2.1, drone_op_2.2, drone_op_2.3, drone_op_2.4, drone_op_2.5);
 
         let pack_type = PacketType::Ack(Ack{fragment_index: 0});
-        let packet3 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 1, hops: [3,1,2].to_vec()},session_id: 1};
-        assert_eq!(drone1.check_unexpected_recipient(&packet3,0),true);
+        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 3, hops: [3,1,2].to_vec()},session_id: 1};
+        assert_eq!(drone2.check_destination_is_drone(&packet1, 0),false);
     }
 }
