@@ -98,7 +98,7 @@ impl GameOfDrones {
     {
         match &packet.pack_type {
             PacketType::FloodRequest(f) => {
-                self.flood_request_handle(packet.clone(), f.path_trace.clone(), f.flood_id, f.initiator_id);
+                self.flood_request_handle(&mut f.clone(), f.flood_id, f.initiator_id, packet.session_id);
             },
             PacketType::MsgFragment(f) => {
                 //b: check pdr
@@ -125,7 +125,7 @@ impl GameOfDrones {
                         let nack_type = NackType::Dropped;
                         self.create_nack_n_send(
                             packet.routing_header.hops.clone(),
-                            packet.routing_header.hop_index,
+                            packet.routing_header.hop_index+1,
                             nack_type,
                             packet.session_id,
                             fragment_index
@@ -152,66 +152,44 @@ impl GameOfDrones {
 
     fn flood_request_handle(
         &mut self,
-        packet: Packet,
-        mut path_trace: Vec<(NodeId, NodeType)>,
+        request: &mut FloodRequest,
         flood_id: u64,
-        initiator_id: u8
+        initiator_id: u8,
+        session_id: u64
     ) {
         if let Some(_id) = self.flood_ids.get(&flood_id) {
             println!("Flooding already received");
-            path_trace.push((self.id, NodeType::Drone));
-            self.create_flood_response_n_send(flood_id, path_trace.clone(),packet.session_id);
+            request.increment(self.id, NodeType::Drone);
+            self.create_flood_response_n_send(flood_id, request.clone(),session_id);
         } else {
             self.flood_ids.insert(flood_id);
-            path_trace.push((self.id, NodeType::Drone));
+            request.increment(self.id, NodeType::Drone);
             if self.get_neighbours_id().len()==1{   
                 println!("Just one neighbor");
-                self.create_flood_response_n_send(flood_id, path_trace.clone(),packet.session_id);
+                self.create_flood_response_n_send(flood_id, request.clone(),session_id);
             } else {
                 for sender in self.get_neighbours_id() {
-                    if sender != path_trace.clone()[path_trace.clone().len()-2].0{
+                    let mut sub = 0;
+                    if request.path_trace[0].0 != request.initiator_id && request.path_trace.clone().len()<2 {
+                        sub = 1;
+                    } else {
+                        sub=2;
+                    }
+                    if sender != request.path_trace.clone()[request.path_trace.clone().len()-sub].0{
                         let facket = Packet {
-                            pack_type: PacketType::FloodRequest(FloodRequest{flood_id,initiator_id,path_trace: path_trace.clone()}),
-                            routing_header: packet.routing_header.clone(),
-                            session_id: packet.session_id
+                            pack_type: PacketType::FloodRequest(FloodRequest{flood_id,initiator_id,path_trace: request.path_trace.clone()}),
+                            routing_header: SourceRoutingHeader { hop_index: 1, hops: [].to_vec() },
+                            session_id
                         };
                         self.packet_send.get(&sender).unwrap().send(facket.clone()).ok();
-                        self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
+                        self.controller_send.send(DroneEvent::PacketSent(facket.clone())).ok();
                     }
                 }
             }
         }
     }
 
-    //Function to handle flood_response packets, as stated in the protocol the routing_header is not to be
-    // ignored, but it can't be dropped; so it execute all the steps of the drone protocol paragraph minus the
-    // drop part 
-
-    // fn flood_response_handle(&self, mut packet: Packet) {
-    //     //Step 1
-    //     if self.check_unexpected_recipient(&packet, 0) {
-    //         //Step 3
-    //         if self.check_destination_is_drone(&packet, 0) {
-    //             if self.check_error_in_routing(&packet, 0) {
-    //                 //Step 5
-    //                 packet.routing_header.hop_index += 1;
-    //                 let next_hop = packet.routing_header.hops[packet.routing_header.hop_index];
-    //                 self.packet_send
-    //                     .get(&next_hop)
-    //                     .unwrap()
-    //                     .send(packet.clone())
-    //                     .ok();
-    //                 self.controller_send.send(DroneEvent::PacketSent(packet.clone())).ok();
-    //             } else {
-    //                 println!("ERROR IN ROUTING");
-    //             }
-    //         } else {
-    //             println!("ERROR IN DEST");
-    //         }
-    //     } else {
-    //         println!("ERROR IN RECIPIENT");
-    //     }
-    // }
+    
 
     //Nack and Ack messages are treated the same by the drones so we use just one function
     //TODO!!: probably better to merge flood_response_handle with nack_ack_handle
@@ -233,9 +211,11 @@ impl GameOfDrones {
                     eprintln!("Error in routing");
                 }
             } else {
+                self.controller_send.send(DroneEvent::ControllerShortcut(packet.clone())).ok();
                 eprintln!("Error in destination");
             }
         } else {
+            self.controller_send.send(DroneEvent::ControllerShortcut(packet.clone())).ok();
             eprintln!("Error in recipient");
         }
     }
@@ -251,7 +231,7 @@ impl GameOfDrones {
             let nack_type = NackType::UnexpectedRecipient(self.id);
             self.create_nack_n_send(
                 packet.routing_header.hops.clone(),
-                packet.routing_header.hop_index,
+                packet.routing_header.hop_index+1,
                 nack_type,
                 packet.session_id,
                 fragment_index
@@ -264,13 +244,13 @@ impl GameOfDrones {
     // Function to check if the drone is the dest of the packet, behavior as the previous function
 
     fn check_destination_is_drone(&self, packet: &Packet, fragment_index: u64) -> bool {
-        if packet.routing_header.hop_index != packet.routing_header.hops.len() {
+        if packet.routing_header.hop_index != packet.routing_header.hops.len()-1 {
             true
         } else {
             let nack_type = NackType::DestinationIsDrone;
             self.create_nack_n_send(
                 packet.routing_header.hops.clone(),
-                packet.routing_header.hop_index,
+                packet.routing_header.hop_index+1,
                 nack_type,
                 packet.session_id,
                 fragment_index
@@ -323,7 +303,7 @@ impl GameOfDrones {
             hop_index: 1,
             hops: hops.clone().split_at(hop_index).0.to_vec(),
         };
-        println!("{}",hop_index);
+        println!("{} {:?}",hop_index,routing_header.clone().hops);
 
         routing_header.hops.reverse();
         let nack  = Nack { fragment_index, nack_type };
@@ -343,22 +323,26 @@ impl GameOfDrones {
 
     //Following the rules of the flooding protocol it does the same as the create_nack_n_send.
 
-    fn create_flood_response_n_send(&self, flood_id: u64, path_trace: Vec<(NodeId, NodeType)>,session_id: u64) {
-        let response = FloodResponse {
-            flood_id,
-            path_trace: path_trace.clone(),
-        };
-        println!("{:?}",path_trace.clone());
-        let mut hops: Vec<u8> = path_trace.clone().into_iter().map(|f| f.0).collect();
+    fn create_flood_response_n_send(&self, flood_id: u64, request: FloodRequest,session_id: u64) {
+        let mut hops = request.path_trace.clone().into_iter().map(|f| f.0).collect::<Vec<u8>>();
         hops.reverse();
-        println!("{:?}",hops.clone());
-        let packet = Packet {
-            pack_type: PacketType::FloodResponse(response),
-            routing_header: SourceRoutingHeader { hop_index: 1, hops },
-            session_id,
+
+        if let Some(destination) = hops.last() {
+            if *destination != request.initiator_id {
+                hops.push(request.initiator_id);
+            }
+        }
+
+        let mut packet = Packet {
+            pack_type: PacketType::FloodResponse(FloodResponse { flood_id, path_trace: request.path_trace }),
+            routing_header: SourceRoutingHeader { hop_index: 1, hops: hops.clone() },
+            session_id
         };
+        let next_hop = packet.clone().routing_header.hops[packet.routing_header.hop_index];
+        
+        println!("Trace {:?}   Self {}  Hop {}",packet.clone().routing_header,self.id,next_hop);
         self.packet_send
-            .get(&packet.routing_header.hops[packet.routing_header.hop_index])
+            .get(&next_hop)
             .unwrap()
             .send(packet.clone())
             .ok();
@@ -508,7 +492,7 @@ mod test {
         let drone2 = GameOfDrones::new(drone_op_2.0, drone_op_2.1, drone_op_2.2, drone_op_2.3, drone_op_2.4, drone_op_2.5);
 
         let pack_type = PacketType::Ack(Ack{fragment_index: 0});
-        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 3, hops: [3,1,2].to_vec()},session_id: 1};
-        assert_eq!(drone2.check_destination_is_drone(&packet1, 0),false);
+        let packet1 = Packet { pack_type:pack_type.clone(), routing_header: SourceRoutingHeader {hop_index: 2, hops: [3,1,2].to_vec()},session_id: 1};
+        assert_eq!(drone2.check_unexpected_recipient(&packet1, 0),true);
     }
 }
